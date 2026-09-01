@@ -1,0 +1,214 @@
+---
+title: "Rambachan-Roth (2023) Sensitivity Analysis -- All Four Specifications"
+output: html_document
+---
+
+This document runs the Rambachan & Roth (2023) relative-magnitude sensitivity
+analysis on the four event-study specifications from Section 4.2 / Eq. (1):
+LM_AIOE x {log employment, log wage} and MS_SCORE x {log employment, log wage}.
+
+For each specification it computes:
+
+1. The standard (M-bar = 0) confidence interval, as a benchmark
+2. Robust confidence intervals across a grid of relative-magnitude values M-bar
+3. The **breakdown value**: the smallest M-bar at which the confidence set
+   first includes zero (i.e., the point at which the significant effect
+   would no longer be supported)
+4. A sensitivity plot for each specification
+5. A single summary table across all four specifications
+
+## Step 0: Install and load required packages (run once)
+
+```{r setup, message=FALSE}
+required_pkgs <- c("remotes", "dplyr", "ggplot2", "purrr")
+for (p in required_pkgs) {
+  if (!requireNamespace(p, quietly = TRUE)) install.packages(p)
+}
+
+if (!requireNamespace("HonestDiD", quietly = TRUE)) {
+  remotes::install_github("asheshrambachan/HonestDiD")
+}
+
+library(HonestDiD)
+library(dplyr)
+library(ggplot2)
+library(purrr)
+```
+
+## Step 1: Load event-study coefficients and covariance matrices
+
+Inputs are the four pairs of CSV files exported from the Python event-study
+script (`did_unified.ipynb`, via the `export_for_honestdid()` helper):
+
+- `coefs_<index>_<outcome>.csv`  -- one column of coefficients, ordered
+  chronologically (pre-period years first, then post-period years), with
+  the reference year (2022) omitted
+- `vcov_<index>_<outcome>.csv`   -- the corresponding full covariance matrix
+  (not just standard errors), same row/column order as the coefficient vector
+
+All four specifications share the same panel structure: 8 pre-treatment
+years (2012-2019, since 2020-2021 were excluded from the main sample) and
+3 post-treatment years (2023-2025), confirmed by the Python export step.
+
+```{r step1_config}
+# One entry per specification. Edit paths here if your file names differ.
+specs <- list(
+  list(index = "LM_AIOE",  outcome = "log_emp",  file_tag = "lm_aioe_log_emp",
+       numPrePeriods = 8, numPostPeriods = 3),
+  list(index = "LM_AIOE",  outcome = "log_wage", file_tag = "lm_aioe_log_wage",
+       numPrePeriods = 8, numPostPeriods = 3),
+  list(index = "MS_SCORE", outcome = "log_emp",  file_tag = "ms_score_log_emp",
+       numPrePeriods = 8, numPostPeriods = 3),
+  list(index = "MS_SCORE", outcome = "log_wage", file_tag = "ms_score_log_wage",
+       numPrePeriods = 8, numPostPeriods = 3)
+)
+
+load_spec_data <- function(spec) {
+  betahat <- as.numeric(read.csv(paste0("coefs_", spec$file_tag, ".csv"))[[1]])
+  sigma   <- as.matrix(read.csv(paste0("vcov_", spec$file_tag, ".csv"), header = FALSE))
+
+  # Sanity checks: catch a mismatched file before it silently produces
+  # a nonsensical result later in the pipeline.
+  stopifnot(length(betahat) == spec$numPrePeriods + spec$numPostPeriods)
+  stopifnot(nrow(sigma) == length(betahat), ncol(sigma) == length(betahat))
+
+  list(betahat = betahat, sigma = sigma)
+}
+```
+
+## Step 2: Run the sensitivity analysis for one specification
+
+`l_vec` targets the simple average of the post-treatment coefficients,
+matching the "pooled post-treatment estimate" reported in the dissertation.
+
+```{r step2_function}
+run_honestdid_spec <- function(spec, Mbar_grid = seq(0, 2, by = 0.1)) {
+
+  dat <- load_spec_data(spec)
+  betahat <- dat$betahat
+  sigma   <- dat$sigma
+
+  l_vec <- rep(1 / spec$numPostPeriods, spec$numPostPeriods)
+
+  original <- HonestDiD::constructOriginalCS(
+    betahat        = betahat,
+    sigma          = sigma,
+    numPrePeriods  = spec$numPrePeriods,
+    numPostPeriods = spec$numPostPeriods,
+    l_vec          = l_vec
+  )
+
+  robust <- HonestDiD::createSensitivityResults_relativeMagnitudes(
+    betahat        = betahat,
+    sigma          = sigma,
+    numPrePeriods  = spec$numPrePeriods,
+    numPostPeriods = spec$numPostPeriods,
+    l_vec          = l_vec,
+    Mbarvec        = Mbar_grid
+  )
+
+  # Breakdown value: the first Mbar at which the robust CI covers zero.
+  breakdown_row <- robust %>%
+    mutate(covers_zero = (lb <= 0 & ub >= 0)) %>%
+    filter(covers_zero) %>%
+    slice(1)
+
+  breakdown_mbar <- if (nrow(breakdown_row) == 0) NA_real_ else breakdown_row$Mbar
+
+  list(
+    index          = spec$index,
+    outcome        = spec$outcome,
+    original       = original,
+    robust         = robust,
+    breakdown_mbar = breakdown_mbar
+  )
+}
+```
+
+## Step 3: Run all four specifications
+
+```{r step3_run_all}
+results_all <- map(specs, run_honestdid_spec)
+names(results_all) <- map_chr(specs, ~ paste(.x$index, .x$outcome, sep = " x "))
+```
+
+## Step 4: Summary table across all four specifications
+
+This is the table to report in Section 5.4 of the dissertation.
+
+```{r step4_summary}
+summary_table <- map_dfr(results_all, function(res) {
+  tibble(
+    Index                = res$index,
+    Outcome              = res$outcome,
+    Original_ATT         = res$original$beta_hat,
+    Original_CI_lower    = res$original$lb,
+    Original_CI_upper    = res$original$ub,
+    Breakdown_Mbar        = res$breakdown_mbar
+  )
+})
+
+print(summary_table)
+write.csv(summary_table, "rambachan_roth_summary.csv", row.names = FALSE)
+```
+
+**Interpretation of `Breakdown_Mbar`:** the estimated post-treatment effect
+remains distinguishable from zero as long as post-treatment departures from
+parallel trends are no larger than `Breakdown_Mbar` times the departures
+already observed in the pre-treatment period. A larger value indicates a
+more robust conclusion; `NA` means the confidence set never covered zero
+within the M-bar grid tested (grid may need to be extended -- see Step 6).
+
+## Step 5: Sensitivity plots for each specification
+
+```{r step5_plots, results='asis'}
+for (name in names(results_all)) {
+  res <- results_all[[name]]
+  cat("### ", name, "\n\n")
+  fig <- HonestDiD::createSensitivityPlot_relativeMagnitudes(res$robust, res$original)
+  print(fig)
+  ggsave(paste0("rambachan_roth_", gsub(" x ", "_", tolower(name)), ".png"),
+         fig, width = 7, height = 5, dpi = 300)
+  cat("\n\n")
+}
+```
+
+## Step 6: If a breakdown value is NA, extend the grid
+
+If any specification shows `NA` in the summary table, re-run just that one
+with a wider M-bar grid before concluding the effect is fully robust:
+
+```{r step6_widen_grid, eval=FALSE}
+# Example: re-check the LM_AIOE log_wage specification with a wider grid
+wide_result <- run_honestdid_spec(specs[[2]], Mbar_grid = seq(0, 5, by = 0.25))
+wide_result$breakdown_mbar
+```
+
+## Writing template for Section 5.4
+
+Once the table above is final, replace the placeholder in Section 4.2 /
+5.4 of the dissertation with a paragraph along these lines (fill in the
+actual numbers from `summary_table`):
+
+> Applying the relative-magnitude sensitivity analysis of Rambachan and
+> Roth (2023) to the pooled post-treatment estimates, the breakdown value
+> under LM_AIOE is **M-bar = [X]** for wages and **M-bar = [X]** for
+> employment; under MS_SCORE the corresponding values are **M-bar = [X]**
+> and **M-bar = [X]**. [Comment on whether the wage result is more or less
+> robust than the employment result, and whether this is consistent with
+> the pre-trend evidence discussed in Section 5.1.]
+
+**Notes:**
+
+- The pre-period is not evenly spaced in calendar time (2019 to 2022 skips
+  2020-2021), even though it is evenly spaced in the *event-time index*
+  used here (each pre-period year still gets one coefficient, one apart in
+  the index). `HonestDiD`'s default assumes evenly spaced relative-time
+  periods, which matches how the coefficients were indexed here -- but if
+  you want to be fully rigorous about the calendar-time gap, consult the
+  package documentation on irregularly spaced periods, or note this
+  simplification explicitly as a limitation.
+- All four specifications use the *baseline* event study (no Job Zone
+  control). If you also want a sensitivity check under the Job Zone-adjusted
+  specification, export coefficients/vcov from `did_with_controls_unified`
+  the same way and add four more entries to the `specs` list above.

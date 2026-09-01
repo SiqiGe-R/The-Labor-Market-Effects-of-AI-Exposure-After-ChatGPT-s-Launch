@@ -1,0 +1,326 @@
+---
+title: "GSC Robustness Check: Microsoft AI Applicability Score"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## STEP 1: Load data
+
+```{r load-data}
+library(gsynth)
+library(dplyr)
+library(ggplot2)
+
+df <- read.csv("bls_onet_felten_ms_panel_harmonised.csv")
+
+# Exclude COVID years
+df <- df %>% filter(!(year %in% c(2020, 2021)))
+
+# Compute log outcomes
+df$log_emp  <- log(df$TOT_EMP)
+df$log_wage <- log(df$A_MEDIAN)
+
+# Replace inf with NA (from log(0))
+df$log_emp[is.infinite(df$log_emp)]   <- NA
+df$log_wage[is.infinite(df$log_wage)] <- NA
+```
+
+## STEP 2: Aggregate to occupation-year level
+
+```{r aggregate}
+occ_year <- df %>%
+  group_by(OCC_CODE, year) %>%
+  summarise(
+    OCC_TITLE = first(OCC_TITLE),
+    # FIX: sum(x, na.rm=TRUE) returns 0 (not NA) when every element of x is
+    # NA -- e.g. an occupation whose TOT_EMP is suppressed/missing across
+    # every NAICS industry in a given year. log(0) = -Inf, which is NOT
+    # caught by is.na()/is.infinite() checks run earlier on df, since this
+    # value is computed fresh here and never re-checked. Guard explicitly.
+    log_emp   = {
+      total_emp <- sum(TOT_EMP, na.rm = TRUE)
+      if (total_emp == 0 || all(is.na(TOT_EMP))) NA_real_ else log(total_emp)
+    },
+    # Employment-weighted mean of log_wage, excluding missing wage rows
+    log_wage  = {
+      valid_idx <- !is.na(log_wage) & !is.na(TOT_EMP)
+      if (sum(TOT_EMP[valid_idx], na.rm = TRUE) == 0) {
+        NA
+      } else {
+        weighted.mean(log_wage[valid_idx], TOT_EMP[valid_idx], na.rm = TRUE)
+      }
+    },
+    MS_SCORE   = first(MS_SCORE),
+    .groups = "drop"
+  )
+
+cat("Occupations:", length(unique(occ_year$OCC_CODE)), "\n")
+cat("Years:", paste(sort(unique(occ_year$year)), collapse=", "), "\n")
+cat("Any -Inf remaining in occ_year$log_emp:", any(is.infinite(occ_year$log_emp)), "\n")
+cat("Rows where log_emp is NA (previously would have been -Inf):",
+    sum(is.na(occ_year$log_emp)), "\n")
+```
+
+## STEP 3: Create binary treatment variable
+
+Treatment = 1 if (occupation is high-MS_SCORE) AND (year >= 2023)
+2022 is the last pre-treatment year (event-time k=-1), matching the DID
+estimating equation, `gsc_analysis.Rmd`, and the descriptive notebook --
+not 2022 itself, since the May 2022 OEWS survey predates the November
+2022 ChatGPT launch entirely.
+
+```{r treatment}
+occ_aioe <- occ_year %>%
+  group_by(OCC_CODE) %>%
+  summarise(MS_SCORE = first(MS_SCORE))
+
+median_aioe <- median(occ_aioe$MS_SCORE, na.rm = TRUE)
+cat("AIOE median:", median_aioe, "\n")
+
+high_aioe_occs <- occ_aioe$OCC_CODE[occ_aioe$MS_SCORE >= median_aioe]
+cat("High AIOE occupations:", length(high_aioe_occs), "\n")
+
+occ_year$D <- as.integer(
+  (occ_year$OCC_CODE %in% high_aioe_occs) & (occ_year$year >= 2023)
+)
+
+# Drop rows with missing outcomes or AIOE
+occ_year <- occ_year %>% filter(!is.na(MS_SCORE), !is.na(log_emp))
+
+# Convert OCC_CODE to numeric ID (gsynth needs numeric unit index)
+occ_year$unit_id <- as.numeric(factor(occ_year$OCC_CODE))
+
+cat("Final panel rows:", nrow(occ_year), "\n")
+cat("Unique units:", length(unique(occ_year$unit_id)), "\n")
+```
+
+## STEP 4: Check panel balance
+
+gsynth requires a balanced panel.
+
+```{r balance-check}
+# Computed from the data rather than hardcoded -- previously fixed at 9,
+# which only matched the old 2015-2019+2022-2025 range. With the panel now
+# extended back to 2012, a hardcoded 9 would mark every unit "incomplete"
+# and silently produce an empty balanced panel.
+n_years_expected <- length(unique(occ_year$year))
+cat("Expected years per balanced unit:", n_years_expected, "\n")
+
+balance_check <- occ_year %>%
+  group_by(unit_id) %>%
+  summarise(n_years = n())
+cat("Units with complete years:", sum(balance_check$n_years == n_years_expected), "\n")
+cat("Units with incomplete years:", sum(balance_check$n_years != n_years_expected), "\n")
+
+# Keep only balanced units
+balanced_units <- balance_check$unit_id[balance_check$n_years == n_years_expected]
+occ_year_balanced <- occ_year %>% filter(unit_id %in% balanced_units)
+cat("Final balanced panel rows:", nrow(occ_year_balanced), "\n")
+```
+
+## STEP 5: Run GSC for Employment
+
+```{r gsc-employment}
+gsc_emp <- gsynth(
+  log_emp ~ D,
+  data = occ_year_balanced,
+  index = c("unit_id", "year"),
+  force = "two-way",
+  CV = TRUE,
+  r = c(0, 5),
+  se = TRUE,
+  inference = "parametric",
+  nboots = 200,
+  parallel = TRUE,
+  seed = 42
+)
+
+print(gsc_emp)
+```
+
+```{r gsc-employment-plot, fig.width=10, fig.height=6}
+plot(gsc_emp, type = "gap", main = "GSC: Effect of AI Exposure on Log Employment - MS")
+```
+
+```{r gsc-employment-counterfactual, fig.width=10, fig.height=6}
+plot(gsc_emp, type = "counterfactual", main = "GSC Counterfactual: Log Employment - MS")
+```
+
+## STEP 6: Run GSC for Wage
+
+```{r gsc-wage}
+# gsynth requires a balanced panel. Simply dropping rows with missing
+# log_wage (as before) does not guarantee balance -- an occupation missing
+# wage in just one year would be left with a gap instead of being dropped
+# entirely. Match gsc_analysis.Rmd: keep only occupations with wage data in
+# every year of the balanced panel.
+wage_complete_units <- occ_year_balanced %>%
+  group_by(unit_id) %>%
+  summarise(n_valid_wage = sum(!is.na(log_wage))) %>%
+  filter(n_valid_wage == n_years_expected) %>%
+  pull(unit_id)
+
+cat("Units with complete wage data:", length(wage_complete_units), "\n")
+
+occ_year_balanced_wage <- occ_year_balanced %>%
+  filter(unit_id %in% wage_complete_units)
+
+cat("Wage balanced panel rows:", nrow(occ_year_balanced_wage), "\n")
+cat("Wage balanced units:", length(unique(occ_year_balanced_wage$unit_id)), "\n")
+
+# Sanity check: both treatment arms must be present, or gsynth/fect will
+# error out with "no never-treated units found".
+d_by_unit <- occ_year_balanced_wage %>% group_by(unit_id) %>% summarise(ever_treated = max(D))
+cat("Never-treated (control) units:", sum(d_by_unit$ever_treated == 0), "\n")
+cat("Ever-treated units:", sum(d_by_unit$ever_treated == 1), "\n")
+
+gsc_wage <- gsynth(
+  log_wage ~ D,
+  data = occ_year_balanced_wage,
+  index = c("unit_id", "year"),
+  force = "two-way",
+  CV = TRUE,
+  r = c(0, 5),
+  se = TRUE,
+  inference = "parametric",
+  nboots = 200,
+  parallel = TRUE,
+  seed = 42
+)
+
+print(gsc_wage)
+```
+
+```{r gsc-wage-plot, fig.width=10, fig.height=6}
+plot(gsc_wage, type = "gap", main = "GSC: Effect of AI Exposure on Log Wage - MS")
+```
+
+```{r gsc-wage-counterfactual, fig.width=10, fig.height=6}
+plot(gsc_wage, type = "counterfactual", main = "GSC Counterfactual: Log Wage - MS")
+```
+
+## STEP 6.5: Diagnostic — does MS_SCORE x Wage show the same pre-trend issue?
+
+Before porting over the whole de-trending workflow built for LM_AIOE x Wage
+(STEP 6.5/6.6 in `gsc_analysis.Rmd`), check whether MS_SCORE x Wage actually
+has a similar problem in the first place. This is the same model-free check
+used to originally discover the LM_AIOE issue: raw group-mean log_wage by
+year, no fixed effects, no regression -- just averages.
+
+```{r ms-wage-raw-gap-check}
+high_units_wage_ms <- occ_year_balanced_wage %>% filter(D == 1) %>% pull(unit_id) %>% unique()
+
+wage_raw_check_ms <- occ_year_balanced_wage %>%
+  mutate(group = ifelse(unit_id %in% high_units_wage_ms, "High", "Low")) %>%
+  group_by(year, group) %>%
+  summarise(mean_log_wage = mean(log_wage, na.rm = TRUE), n = n(), .groups = "drop")
+
+wage_gap_by_year_ms <- wage_raw_check_ms %>%
+  select(year, group, mean_log_wage) %>%
+  tidyr::pivot_wider(names_from = group, values_from = mean_log_wage) %>%
+  mutate(gap = High - Low) %>%
+  arrange(year)
+
+print(wage_gap_by_year_ms, n = 20)
+write.csv(wage_gap_by_year_ms, "wage_gap_by_year_ms.csv", row.names = FALSE)
+```
+
+```{r ms-wage-raw-gap-plot, fig.width=9, fig.height=5.5}
+ggplot(wage_gap_by_year_ms, aes(x = year, y = gap)) +
+  geom_line(color = "#1C7293", linewidth = 1) +
+  geom_point(color = "#1C7293", size = 2.5) +
+  geom_vline(xintercept = 2022.5, linetype = "dashed", color = "gray40") +
+  labs(title = "MS_SCORE x Wage: raw group-mean gap (High - Low), no fixed effects",
+       x = "Year", y = "Log wage gap") +
+  theme_minimal()
+```
+
+Read this the same way as the LM_AIOE version: if `gap` shrinks smoothly and
+monotonically across 2012-2022 the way it did for LM_AIOE (0.44 -> 0.37),
+the same de-trending workflow (STEP 6.5/6.6-equivalent) is worth porting
+over. If it's flat, noisy, or non-monotonic instead, this is a different
+situation and copying the LM_AIOE fix wouldn't be appropriate -- share the
+output before building anything further here.
+
+**Confirmed: MS_SCORE x Wage shows the same pattern.** The gap declines
+smoothly from 0.284 (2012) to 0.265 (2019) -- a similar relative decline to
+LM_AIOE's (roughly 6.7% vs 7.7%) -- and keeps declining through 2022-2025
+with no jump at the COVID splice point. Worth applying the same two-step
+de-trending used for LM_AIOE.
+
+## STEP 6.6: Method A — two-step de-trending (same approach as LM_AIOE)
+
+```{r ms-method-a-step1-estimate-trend}
+library(fixest)
+
+occ_year_balanced_wage <- occ_year_balanced_wage %>%
+  arrange(year) %>%
+  mutate(period_index = as.integer(factor(year, levels = sort(unique(year))))) %>%
+  group_by(unit_id) %>%
+  mutate(group_dummy = as.integer(max(D) == 1)) %>%
+  ungroup()
+
+# Fit the differential trend using PRE-TREATMENT data only (year <= 2022),
+# so the 2023-2025 treatment effect cannot contaminate the trend estimate.
+pre_data_ms <- occ_year_balanced_wage %>% filter(year <= 2019)
+
+trend_reg_ms <- feols(
+  log_wage ~ group_dummy:period_index | unit_id + year,
+  data = pre_data_ms
+)
+print(summary(trend_reg_ms))
+
+beta_trend_ms <- coef(trend_reg_ms)["group_dummy:period_index"]
+cat("\nEstimated high-exposure-group-specific linear trend slope (pre-period only):", beta_trend_ms, "\n")
+```
+
+```{r ms-method-a-step2-detrend-and-rerun}
+occ_year_balanced_wage <- occ_year_balanced_wage %>%
+  mutate(log_wage_detrended = log_wage - beta_trend_ms * period_index * group_dummy)
+
+gsc_wage_detrended_ms <- gsynth(
+  log_wage_detrended ~ D,
+  data = occ_year_balanced_wage,
+  index = c("unit_id", "year"),
+  force = "two-way",
+  CV = TRUE,
+  r = c(0, 5),
+  se = TRUE,
+  inference = "parametric",
+  nboots = 200,
+  parallel = TRUE,
+  seed = 42
+)
+
+print(gsc_wage_detrended_ms)
+```
+
+```{r ms-method-a-plot, fig.width=10, fig.height=6}
+plot(gsc_wage_detrended_ms, type = "gap", main = "GSC: MS_SCORE Log Wage Effect, after two-step de-trending")
+```
+
+```{r ms-method-a-compare}
+cat("=== MS_SCORE Wage: comparison, original vs de-trended ===\n")
+cat("Original (no trend control):", gsc_wage$est.avg[1, "ATT.avg"], "\n")
+cat("Two-step de-trended:        ", gsc_wage_detrended_ms$est.avg[1, "ATT.avg"], "\n")
+cat("\nRatio, de-trended / original:", gsc_wage_detrended_ms$est.avg[1, "ATT.avg"] / gsc_wage$est.avg[1, "ATT.avg"], "\n")
+cat("\nSee the full 'by Period' table in the print(gsc_wage_detrended_ms) output above --\n")
+cat("compare the k=-8..-1 rows there to the original gsc_wage output to check\n")
+cat("whether de-trending flattened the pre-period coefficients.\n")
+```
+
+## STEP 7: Save results summary
+
+```{r save-summary}
+sink("gsc_ms_results_summary.txt")
+cat("=== GSC Employment Results ===\n")
+print(gsc_emp)
+cat("\n\n=== GSC Wage Results ===\n")
+print(gsc_wage)
+sink()
+
+cat("Done. Check gsc_ms_results_summary.txt\n")
+```

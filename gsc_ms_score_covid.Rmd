@@ -1,0 +1,226 @@
+---
+title: "GSC Robustness Check: Microsoft AI Applicability Score — COVID-Inclusive Analysis"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Overview
+
+**Robustness variant:** Includes OEWS years 2020 and 2021 (COVID years) in the estimation sample.
+
+Baseline (`gsc_ms_score (3).Rmd`) excluded 2020–2021. This version includes them to test whether COVID volatility substantially changes the estimated treatment effect.
+
+Treatment timing remains: 2022 = final pre-treatment year, 2023 = first post-treatment year (matching DID and SC specifications).
+
+## STEP 1: Load data
+
+```{r load-data}
+library(gsynth)
+library(dplyr)
+library(ggplot2)
+
+df <- read.csv("bls_onet_felten_ms_panel_harmonised.csv")
+
+# COVID-INCLUSIVE: do not exclude years 2020, 2021
+# df <- df %>% filter(!(year %in% c(2020, 2021)))  # COMMENTED OUT for COVID-inclusive analysis
+
+# Compute log outcomes
+df$log_emp  <- log(df$TOT_EMP)
+df$log_wage <- log(df$A_MEDIAN)
+
+# Replace inf with NA (from log(0))
+df$log_emp[is.infinite(df$log_emp)]   <- NA
+df$log_wage[is.infinite(df$log_wage)] <- NA
+
+cat("Data loaded. Year range:", min(df$year), "to", max(df$year), "\n")
+```
+
+## STEP 2: Aggregate to occupation-year level
+
+```{r aggregate}
+occ_year <- df %>%
+  group_by(OCC_CODE, year) %>%
+  summarise(
+    OCC_TITLE = first(OCC_TITLE),
+    # FIX: sum(x, na.rm=TRUE) returns 0 (not NA) when every element of x is
+    # NA -- e.g. an occupation whose TOT_EMP is suppressed/missing across
+    # every NAICS industry in a given year. log(0) = -Inf, which is NOT
+    # caught by is.na()/is.infinite() checks run earlier on df, since this
+    # value is computed fresh here and never re-checked. Guard explicitly.
+    log_emp   = {
+      total_emp <- sum(TOT_EMP, na.rm = TRUE)
+      if (total_emp == 0 || all(is.na(TOT_EMP))) NA_real_ else log(total_emp)
+    },
+    # Employment-weighted mean of log_wage, excluding missing wage rows
+    log_wage  = {
+      valid_idx <- !is.na(log_wage) & !is.na(TOT_EMP)
+      if (sum(TOT_EMP[valid_idx], na.rm = TRUE) == 0) {
+        NA
+      } else {
+        weighted.mean(log_wage[valid_idx], TOT_EMP[valid_idx], na.rm = TRUE)
+      }
+    },
+    MS_SCORE   = first(MS_SCORE),
+    .groups = "drop"
+  )
+
+cat("Occupations:", length(unique(occ_year$OCC_CODE)), "\n")
+cat("Years:", paste(sort(unique(occ_year$year)), collapse=", "), "\n")
+cat("Any -Inf remaining in occ_year$log_emp:", any(is.infinite(occ_year$log_emp)), "\n")
+cat("Rows where log_emp is NA (previously would have been -Inf):",
+    sum(is.na(occ_year$log_emp)), "\n")
+```
+
+## STEP 3: Create binary treatment variable
+
+Treatment = 1 if (occupation is high-MS_SCORE) AND (year >= 2023)
+2022 is the last pre-treatment year (event-time k=-1), matching the DID
+estimating equation, `gsc_analysis.Rmd`, and the descriptive notebook --
+not 2022 itself, since the May 2022 OEWS survey predates the November
+2022 ChatGPT launch entirely.
+
+```{r treatment}
+occ_aioe <- occ_year %>%
+  group_by(OCC_CODE) %>%
+  summarise(MS_SCORE = first(MS_SCORE))
+
+median_aioe <- median(occ_aioe$MS_SCORE, na.rm = TRUE)
+cat("AIOE median:", median_aioe, "\n")
+
+high_aioe_occs <- occ_aioe$OCC_CODE[occ_aioe$MS_SCORE >= median_aioe]
+cat("High AIOE occupations:", length(high_aioe_occs), "\n")
+
+occ_year$D <- as.integer(
+  (occ_year$OCC_CODE %in% high_aioe_occs) & (occ_year$year >= 2023)
+)
+
+# Drop rows with missing outcomes or AIOE
+occ_year <- occ_year %>% filter(!is.na(MS_SCORE), !is.na(log_emp))
+
+# Convert OCC_CODE to numeric ID (gsynth needs numeric unit index)
+occ_year$unit_id <- as.numeric(factor(occ_year$OCC_CODE))
+
+cat("Final panel rows:", nrow(occ_year), "\n")
+cat("Unique units:", length(unique(occ_year$unit_id)), "\n")
+```
+
+## STEP 4: Check panel balance
+
+gsynth requires a balanced panel.
+
+```{r balance-check}
+# Computed from the data rather than hardcoded -- previously fixed at 9,
+# which only matched the old 2015-2019+2022-2025 range. With the panel now
+# extended back to 2012, a hardcoded 9 would mark every unit "incomplete"
+# and silently produce an empty balanced panel.
+n_years_expected <- length(unique(occ_year$year))
+cat("Expected years per balanced unit:", n_years_expected, "\n")
+
+balance_check <- occ_year %>%
+  group_by(unit_id) %>%
+  summarise(n_years = n())
+cat("Units with complete years:", sum(balance_check$n_years == n_years_expected), "\n")
+cat("Units with incomplete years:", sum(balance_check$n_years != n_years_expected), "\n")
+
+# Keep only balanced units
+balanced_units <- balance_check$unit_id[balance_check$n_years == n_years_expected]
+occ_year_balanced <- occ_year %>% filter(unit_id %in% balanced_units)
+cat("Final balanced panel rows:", nrow(occ_year_balanced), "\n")
+```
+
+## STEP 5: Run GSC for Employment
+
+```{r gsc-employment}
+gsc_emp <- gsynth(
+  log_emp ~ D,
+  data = occ_year_balanced,
+  index = c("unit_id", "year"),
+  force = "two-way",
+  CV = TRUE,
+  r = c(0, 5),
+  se = TRUE,
+  inference = "parametric",
+  nboots = 200,
+  parallel = TRUE,
+  seed = 42
+)
+
+print(gsc_emp)
+```
+
+```{r gsc-employment-plot, fig.width=10, fig.height=6}
+plot(gsc_emp, type = "gap", main = "GSC: Effect of AI Exposure on Log Employment - MS (COVID-INCLUSIVE)")
+```
+
+```{r gsc-employment-counterfactual, fig.width=10, fig.height=6}
+plot(gsc_emp, type = "counterfactual", main = "GSC Counterfactual: Log Employment - MS (COVID-INCLUSIVE)")
+```
+
+## STEP 6: Run GSC for Wage
+
+```{r gsc-wage}
+# gsynth requires a balanced panel. Simply dropping rows with missing
+# log_wage (as before) does not guarantee balance -- an occupation missing
+# wage in just one year would be left with a gap instead of being dropped
+# entirely. Match gsc_analysis.Rmd: keep only occupations with wage data in
+# every year of the balanced panel.
+wage_complete_units <- occ_year_balanced %>%
+  group_by(unit_id) %>%
+  summarise(n_valid_wage = sum(!is.na(log_wage))) %>%
+  filter(n_valid_wage == n_years_expected) %>%
+  pull(unit_id)
+
+cat("Units with complete wage data:", length(wage_complete_units), "\n")
+
+occ_year_balanced_wage <- occ_year_balanced %>%
+  filter(unit_id %in% wage_complete_units)
+
+cat("Wage balanced panel rows:", nrow(occ_year_balanced_wage), "\n")
+cat("Wage balanced units:", length(unique(occ_year_balanced_wage$unit_id)), "\n")
+
+# Sanity check: both treatment arms must be present, or gsynth/fect will
+# error out with "no never-treated units found".
+d_by_unit <- occ_year_balanced_wage %>% group_by(unit_id) %>% summarise(ever_treated = max(D))
+cat("Never-treated (control) units:", sum(d_by_unit$ever_treated == 0), "\n")
+cat("Ever-treated units:", sum(d_by_unit$ever_treated == 1), "\n")
+
+gsc_wage <- gsynth(
+  log_wage ~ D,
+  data = occ_year_balanced_wage,
+  index = c("unit_id", "year"),
+  force = "two-way",
+  CV = TRUE,
+  r = c(0, 5),
+  se = TRUE,
+  inference = "parametric",
+  nboots = 200,
+  parallel = TRUE,
+  seed = 42
+)
+
+print(gsc_wage)
+```
+
+```{r gsc-wage-plot, fig.width=10, fig.height=6}
+plot(gsc_wage, type = "gap", main = "GSC: Effect of AI Exposure on Log Wage - MS (COVID-INCLUSIVE)")
+```
+
+```{r gsc-wage-counterfactual, fig.width=10, fig.height=6}
+plot(gsc_wage, type = "counterfactual", main = "GSC Counterfactual: Log Wage - MS (COVID-INCLUSIVE)")
+```
+
+## STEP 7: Save results summary
+
+```{r save-summary}
+sink("gsc_ms_results_summary_covid.txt")
+cat("=== GSC Employment Results (COVID-INCLUSIVE) ===\n")
+print(gsc_emp)
+cat("\n\n=== GSC Wage Results (COVID-INCLUSIVE) ===\n")
+print(gsc_wage)
+sink()
+
+cat("Done. Check gsc_ms_results_summary_covid.txt\n")
+```
