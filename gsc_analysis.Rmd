@@ -357,9 +357,6 @@ sink()
 
 cat("Done. Check gsc_results_summary.txt\n")
 ```
-```{r}
-"JobZone" %in% colnames(df)
-colnames(occ_year_balanced)
-```
+
 
 
