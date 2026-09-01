@@ -110,7 +110,6 @@ Median wages are combined using an employment-weighted average. This is an appro
 | Script | Purpose |
 |---|---|
 | `explore_onet.ipynb` | Processes and explores the O*NET Task Statements data and produces `onet_merged_tasks.csv` |
-| `merge_felten.ipynb` | Supporting script for merging the Felten LM_AIOE data |
 | `merge_bls_onet.ipynb` | Main harmonisation pipeline producing the final analysis panel |
 
 For replication of the final dissertation analysis, `merge_bls_onet.ipynb` is the main data-construction script.
